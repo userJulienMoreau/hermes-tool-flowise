@@ -4,7 +4,7 @@ Tu lis ce fichier parce que l'utilisateur t'a demandé d'installer l'outil « Fl
 Suis ces étapes dans l'ordre. **Ne jamais afficher ni répéter une clé API.** Arrête-toi et demande à l'utilisateur en cas de doute.
 
 ## 0. Ce qu'il te faut
-- L'URL de Flowise : `http://flowise:3000` si tu tournes dans le conteneur Docker du projet `hermes-flowise`, sinon `http://localhost:3000`.
+- L'URL de Flowise : l'adresse par laquelle **toi** (depuis ton conteneur ou ta machine) joins Flowise. Dans un conteneur, `localhost` ne désigne pas Flowise : utilise le nom de son service ou `host.docker.internal`. Si tu ne la connais pas, demande-la à l'utilisateur.
 - Une **clé API Flowise** : si la variable d'environnement `FLOWISE_API_KEY` est vide, demande à l'utilisateur de la créer (Flowise → *API Keys* → *Add New*) et de
   la placer dans `.env` (ou de te la fournir par un canal sûr). Sans clé, ne continue pas.
 - Ton dossier de données : `$HERMES_HOME` (dans le conteneur : `/opt/data` ; sinon `~/.hermes`).

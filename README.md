@@ -20,14 +20,22 @@ cd hermes-tool-flowise
 FLOWISE_API_KEY=<votre clé> python3 install.py --flowise-url http://localhost:3000
 ```
 
-Puis recharger les outils de Hermes (`/reload-mcp`) ou redémarrer sa passerelle. Valeurs par défaut : dossier `$HERMES_HOME` ou `~/.hermes`.
-Avec le Docker Compose du projet [hermes-flowise](https://github.com/userJulienMoreau/hermes-flowise) (nœuds Flowise → Hermes, planification), Hermes est dans le conteneur `hermes` (données dans `/opt/data`, Flowise sur `http://flowise:3000`) :
+Puis recharger les outils de Hermes (`/reload-mcp`) ou redémarrer sa passerelle. Valeurs par défaut : dossier de données `$HERMES_HOME` ou `~/.hermes`.
+
+**Prérequis, et seulement ceux-là :** Python 3 (bibliothèque standard, rien à installer), un Hermes, un Flowise joignable et une clé API. Aucun autre projet ni
+Docker Compose particulier n'est nécessaire.
+
+**Si Hermes tourne dans un conteneur Docker**, l'installeur doit s'exécuter *dans* ce conteneur, avec le dossier de données de Hermes et l'URL de Flowise
+vus depuis lui. Remplacez les trois valeurs entre chevrons par celles de votre installation :
 
 ```bash
-docker cp . hermes:/tmp/hft          # depuis le dossier cloné
-docker compose exec hermes python3 /tmp/hft/install.py --hermes-home /opt/data --flowise-url http://flowise:3000
-docker compose restart hermes
+docker cp . <conteneur-hermes>:/tmp/hft                  # depuis le dossier cloné
+docker exec <conteneur-hermes> python3 /tmp/hft/install.py \
+    --hermes-home <dossier-de-données-de-Hermes> --flowise-url <URL de Flowise vue depuis le conteneur>
+docker restart <conteneur-hermes>
 ```
+Exemple avec le projet [hermes-flowise](https://github.com/userJulienMoreau/hermes-flowise) (facultatif) : conteneur `hermes`, dossier `/opt/data`, Flowise sur `http://flowise:3000`.
+Depuis un conteneur, `localhost` désigne le conteneur lui-même : utilisez le nom du service ou l'adresse de l'hôte (`host.docker.internal`).
 
 **Faire installer l'outil par Hermes lui-même :** lui envoyer
 « Installe l'outil Flowise : https://github.com/userJulienMoreau/hermes-tool-flowise — suis son `INSTALL.md` ».
