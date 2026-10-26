@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import subprocess
@@ -12,7 +13,18 @@ import server  # noqa: E402
 
 
 def flow(flow_id, name, nodes=(), type_="AGENTFLOW"):
-    return {"id": flow_id, "name": name, "type": type_, "flowData": json.dumps({"nodes": [{"data": {"name": n}} for n in nodes], "edges": []})}
+    """nodes : noms de nœuds, ou dicts « data » complets (pour tester les entrées et les notes)."""
+    def data(n):
+        return {"name": n} if isinstance(n, str) else dict(n)
+
+    return {"id": flow_id, "name": name, "type": type_, "flowData": json.dumps({"nodes": [{"data": data(n)} for n in nodes], "edges": []})}
+
+
+def execution(*nodes, state="ERROR", created=None):
+    """Enregistrement d'exécution Flowise : (nodeId, nodeLabel, status, error)."""
+    created = created or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return {"id": "exec-1", "state": state, "createdDate": created,
+            "executionData": json.dumps([{"nodeId": i, "nodeLabel": l, "status": s, "data": {"error": e}} for i, l, s, e in nodes])}
 
 
 FLOWS = [
@@ -20,12 +32,20 @@ FLOWS = [
     flow("id-echo", "mcp-echo", ["startAgentflow", "directReplyAgentflow"]),
     flow("id-jobs", "mcp-gestion", ["hermesScheduleAgentflow"]),
     flow("id-prive", "surveillance bitcoins", ["hermesTaskAgentflow"]),
+    flow("id-rapport", "mcp-rapport", [
+        {"name": "startAgentflow", "inputs": {"startInputType": "formInput",
+                                             "formInputTypes": [{"type": "string", "name": "sujet"}, {"type": "number", "name": "nbPages"}]}},
+        {"name": "httpAgentflow", "inputs": {}},
+        {"name": "directReplyAgentflow", "inputs": {}},
+        {"name": "stickyNoteAgentflow", "inputs": {"note": "Rapport de veille hebdomadaire\n\nDeuxième ligne, ignorée."}},
+    ]),
 ]
 
 
 class FakeFlowise(BaseHTTPRequestHandler):
     calls = []
     behavior = {}
+    executions = []
 
     def log_message(self, *a):
         pass
@@ -46,6 +66,8 @@ class FakeFlowise(BaseHTTPRequestHandler):
             return self.reply(401, {"error": "Unauthorized"})
         if self.path == "/api/v1/chatflows":
             return self.reply(200, FLOWS)
+        if self.path.startswith("/api/v1/executions"):
+            return self.reply(200, {"data": FakeFlowise.executions, "total": len(FakeFlowise.executions)})
         self.reply(404, {})
 
     def do_POST(self):
@@ -73,6 +95,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         FakeFlowise.calls.clear()
         FakeFlowise.behavior.clear()
+        FakeFlowise.executions = []
         server._slots = None
 
     def cfg(self, **env):
@@ -121,6 +144,20 @@ class ToolsTest(Base):
     def test_allow_par_id(self):
         _, text = self.call("flowise_list_flows", {}, self.cfg(FLOWISE_MCP_ALLOW="id-prive"))
         self.assertIn("surveillance bitcoins", text)
+
+    def test_liste_montre_contrat_entree_et_documentation(self):
+        _, text = self.call("flowise_list_flows", {})
+        rapport = text.split("mcp-rapport")[1].split("\n")[0]
+        self.assertIn("entrée : formulaire (sujet, nbPages)", rapport)      # déduit du nœud Start
+        self.assertIn("doc : « Rapport de veille hebdomadaire »", rapport)  # première ligne de la note
+        self.assertIn("3 nœuds", rapport)                                   # la note autocollante ne compte pas
+        self.assertIn("entrée : texte libre", text.split("mcp-echo")[1].split("\n")[0])
+
+    def test_contrat_entree_par_defaut_et_flow_sans_start(self):
+        self.assertEqual(server.input_contract([{"data": {"name": "startAgentflow", "inputs": {}}}]), "texte libre")
+        self.assertEqual(server.input_contract([{"data": {"name": "startAgentflow", "inputs": {"startInputType": "webhookTrigger"}}}]), "webhook")
+        self.assertIsNone(server.input_contract([{"data": {"name": "directReplyAgentflow"}}]))
+        self.assertIsNone(server.summary([{"data": {"name": "stickyNoteAgentflow", "inputs": {"note": "\n\n"}}}]))
 
     def test_run_par_nom_et_par_id(self):
         for ref in ("mcp-echo", "MCP-ECHO", "id-echo"):
@@ -180,6 +217,62 @@ class ToolsTest(Base):
         self.assertIn("Trop d'appels", text)
 
 
+class DiagnosisTest(Base):
+    """Un échec doit nommer le nœud fautif, lu dans la dernière exécution enregistrée par Flowise."""
+
+    def test_echec_nomme_le_noeud_fautif(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (500, {"message": "buildChatflow - NodeVM Execution Error"})
+        FakeFlowise.executions = [execution(
+            ("startAgentflow_0", "Start", "FINISHED", None),
+            ("customFunctionAgentflow_0", "Analyser", "ERROR", "Error: NodeVM Execution Error: Error: BOOM-TEST"))]
+        err, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertTrue(err)
+        self.assertRegex(text, "HTTP 500")  # l'erreur d'origine reste en tête
+        self.assertIn("nœud « Analyser » (customFunctionAgentflow_0)", text)
+        self.assertIn("BOOM-TEST", text)
+        self.assertIn("Dernier nœud réussi : startAgentflow_0", text)
+
+    def test_echec_sans_trace_garde_le_message_d_origine(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (500, {"message": "Boom"})
+        FakeFlowise.executions = []  # Flowise n'a rien enregistré
+        err, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertTrue(err)
+        self.assertRegex(text, "HTTP 500.*Boom")
+        self.assertNotIn("Trace Flowise", text)
+
+    def test_diagnostic_sans_noeud_en_erreur_n_est_pas_ajoute(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (500, {"message": "Boom"})
+        FakeFlowise.executions = [execution(("startAgentflow_0", "Start", "FINISHED", None), state="FINISHED")]
+        err, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertTrue(err)
+        self.assertNotIn("Trace Flowise", text)
+
+    def test_trace_illisible_ou_api_absente_ne_casse_rien(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (500, {"message": "Boom"})
+        FakeFlowise.executions = [{"id": "x", "state": "ERROR", "createdDate": "hier", "executionData": "pas du JSON"}]
+        err, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertTrue(err)
+        self.assertRegex(text, "HTTP 500.*Boom")
+
+    def test_trace_trop_ancienne_repliee_sur_la_plus_recente(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (500, {"message": "Boom"})
+        FakeFlowise.executions = [execution(("vieux_0", "Vieux", "ERROR", "erreur ancienne"), created="2020-01-01T00:00:00.000Z")]
+        _, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertIn("Vieux", text)  # faute de mieux, on lit la plus récente disponible
+
+    def test_verbose_ajoute_la_trace_des_noeuds(self):
+        FakeFlowise.behavior["/api/v1/prediction/id-echo"] = (200, {"text": "ok", "agentFlowExecutedData": [
+            {"nodeId": "startAgentflow_0", "nodeLabel": "Start", "status": "FINISHED"},
+            {"nodeId": "directReplyAgentflow_0", "nodeLabel": "Réponse", "status": "FINISHED"}]})
+        err, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x", "verbose": True})
+        self.assertFalse(err)
+        self.assertTrue(text.startswith("ok"))
+        self.assertIn("Trace des nœuds", text)
+        self.assertIn("directReplyAgentflow_0 (Réponse) : FINISHED", text)
+        _, text = self.call("flowise_run_flow", {"flow": "mcp-echo", "question": "x"})
+        self.assertNotIn("Trace des nœuds", text)  # silencieux par défaut
+
+
 class ProtocolTest(unittest.TestCase):
     def test_initialize_et_liste_des_outils(self):
         cfg = server.load_config({})
@@ -190,6 +283,7 @@ class ProtocolTest(unittest.TestCase):
         tools = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, cfg)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["flowise_list_flows", "flowise_run_flow"])
         self.assertEqual(tools[1]["inputSchema"]["required"], ["flow", "question"])
+        self.assertIn("verbose", tools[1]["inputSchema"]["properties"])
 
     def test_notification_sans_reponse_methode_et_outil_inconnus(self):
         cfg = server.load_config({})
@@ -221,7 +315,7 @@ class StdioEndToEnd(Base):
         env = {**os.environ, "FLOWISE_URL": self.url, "FLOWISE_API_KEY": "secret"}
         r = subprocess.run([sys.executable, os.path.join(ROOT, "server.py"), "--selftest"], capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(r.returncode, 0)
-        self.assertIn("2 exposé(s)", r.stdout)
+        self.assertIn("3 exposé(s)", r.stdout)
         self.assertNotIn("secret", r.stdout)  # la clé n'est jamais affichée
         bad = subprocess.run([sys.executable, os.path.join(ROOT, "server.py"), "--selftest"], capture_output=True, text=True, env={**env, "FLOWISE_API_KEY": "x"}, timeout=30)
         self.assertEqual(bad.returncode, 1)

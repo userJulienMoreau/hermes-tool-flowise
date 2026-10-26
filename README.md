@@ -4,8 +4,8 @@ Donne à l'agent [Hermes](https://hermes-agent.nousresearch.com/docs) deux outil
 
 | Outil (nom côté Hermes) | Rôle |
 |---|---|
-| `mcp__flowise__flowise_list_flows` | liste les flows que l'agent a le droit d'exécuter |
-| `mcp__flowise__flowise_run_flow` | exécute un flow (`flow` = nom ou id, `question` = entrée) et renvoie sa réponse |
+| `mcp__flowise__flowise_list_flows` | liste les flows que l'agent a le droit d'exécuter, avec pour chacun l'entrée attendue, sa documentation et son nombre de nœuds |
+| `mcp__flowise__flowise_run_flow` | exécute un flow (`flow` = nom ou id, `question` = entrée, `session_id`, `verbose`) et renvoie sa réponse ; en cas d'échec, **nomme le nœud fautif** |
 
 C'est un **serveur MCP** (stdio) en un seul fichier Python, **sans dépendance** : `server.py`. L'installeur `install.py` le déclare dans
 la configuration de Hermes (`mcp_servers:` de `config.yaml`, documenté dans la [référence MCP de Hermes](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference)).
@@ -60,6 +60,52 @@ L'installeur est idempotent, sauvegarde `config.yaml` (`config.yaml.bak-flowise-
 **Boucle possible :** un flow qui contient un nœud *Hermes Task* rappelle Hermes. `flowise_list_flows` le signale
 (« appelle Hermes : ne pas le rappeler depuis ce flow ») ; ne donnez pas à un tel flow le droit de rappeler cet outil.
 
+## Savoir ce que l'agent appelle
+
+L'agent ne voyait que le nom, l'id et le type : il devait deviner si la `question` attendue était un sujet, un
+critère ou du JSON. `flowise_list_flows` décrit maintenant chaque flow à partir de son propre graphe :
+
+```
+- mcp-exemple-veille-crypto (id 08765dba-…, AGENTFLOW) · entrée : texte libre · 10 nœuds · doc : « EXEMPLE — veille de marché à seuil » · [appelle Hermes : …]
+- mcp-rapport (id …, AGENTFLOW) · entrée : formulaire (sujet, nbPages) · 3 nœuds · doc : « Rapport de veille hebdomadaire »
+```
+
+- **Entrée attendue** : déduite du nœud *Start* — `texte libre` (Chat Input), `formulaire` suivi du nom de ses champs
+  (Form Input), `webhook`, ou `planifié`.
+- **Documentation** : la **première ligne non vide de la première note autocollante** (Sticky Note) du flow.
+  Convention simple et sans configuration : posez une note en tête de flow, elle devient sa description.
+  Un flow sans note n'affiche simplement pas de `doc :`.
+- **Nombre de nœuds** : les notes autocollantes ne sont pas comptées.
+
+## Diagnostiquer un échec
+
+Quand un nœud échoue, la réponse de `/api/v1/prediction` **ne dit pas lequel** : Flowise renvoie un HTTP 500 avec
+un message brut (`Cannot read properties of undefined (reading 'trim')`). Le serveur relit donc la dernière
+exécution enregistrée par Flowise (`GET /api/v1/executions?chatflowId=…`) et complète l'erreur :
+
+```
+Erreur : Flowise a répondu HTTP 500. {"message":"Error: predictionsServices.buildChatflow - Error: NodeVM Execution Error: Error: BOOM-TEST"}
+Trace Flowise : nœud « cf qui plante » (customFunctionAgentflow_0) : Error: NodeVM Execution Error: Error: BOOM-TEST
+Dernier nœud réussi : startAgentflow_0
+```
+
+L'erreur d'origine est toujours conservée en tête ; le diagnostic vient en complément. Si l'API des exécutions
+n'est pas disponible (version ancienne de Flowise, droits, panne) ou si la trace est illisible, le message
+d'origine est renvoyé inchangé — jamais d'échec à cause du diagnostic.
+
+Sur une exécution **réussie**, `verbose=true` ajoute la trace complète, utile pour comprendre un résultat inattendu :
+
+```
+NO_ALERT
+
+Trace des nœuds :
+  - startAgentflow_0 (Start) : FINISHED
+  - customFunctionAgentflow_0 (1. Préparer le critère) : FINISHED
+  - httpAgentflow_0 (2. Interroger CoinGecko) : FINISHED
+  - hermesTaskAgentflow_0 (5. Verdict Hermes) : FINISHED
+  - directReplyAgentflow_1 (7b. Silence (NO_ALERT)) : FINISHED
+```
+
 ## Vérification et dépannage
 
 ```bash
@@ -73,13 +119,14 @@ FLOWISE_URL=http://localhost:3000 FLOWISE_API_KEY=... python3 ~/.hermes/tools/fl
 | « Flowise injoignable » | `FLOWISE_URL` : depuis un conteneur Hermes, utiliser le nom de service (`http://flowise:3000`), pas `localhost` |
 | Outils absents après l'installation | `/reload-mcp` ou redémarrage de la passerelle ; vérifier `mcp_servers.flowise` dans `config.yaml` |
 | Un flow lent | ajuster `FLOWISE_MCP_TIMEOUT` et `timeout:` du serveur (secondes) |
+| L'erreur ne nomme pas le nœud | aucune exécution exploitable côté Flowise : lancer le flow une fois depuis son interface, puis réessayer |
 
 Désinstaller : `python3 install.py --uninstall` (retire l'entrée de `config.yaml` et `tools/flowise-mcp/`, conserve la clé de `.env`).
 
 ## Développement
 
 ```bash
-python3 -I -m unittest discover -s tests     # 35 tests : protocole stdio, outils, filtre, installeur
+python3 -I -m unittest discover -s tests     # 43 tests : protocole stdio, outils, filtre, diagnostic, installeur
 ```
 Le serveur parle JSON-RPC 2.0 (un message par ligne) et accepte les versions de protocole MCP 2025-06-18, 2025-03-26 et 2024-11-05. Les tests
 lancent `server.py` comme le fait Hermes (processus + stdio) contre un faux Flowise HTTP.
