@@ -83,3 +83,7 @@ python3 -I -m unittest discover -s tests     # 35 tests : protocole stdio, outil
 ```
 Le serveur parle JSON-RPC 2.0 (un message par ligne) et accepte les versions de protocole MCP 2025-06-18, 2025-03-26 et 2024-11-05. Les tests
 lancent `server.py` comme le fait Hermes (processus + stdio) contre un faux Flowise HTTP.
+
+## Licence
+
+[MIT](LICENSE) — usage, copie, modification et redistribution libres, sans garantie.
