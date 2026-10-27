@@ -1,11 +1,12 @@
 # hermes-tool-flowise — l'outil Flowise pour Hermes Agent
 
-Donne à l'agent [Hermes](https://hermes-agent.nousresearch.com/docs) deux outils pour utiliser vos flows [Flowise](https://docs.flowiseai.com) :
+Donne à l'agent [Hermes](https://hermes-agent.nousresearch.com/docs) trois outils pour utiliser vos flows [Flowise](https://docs.flowiseai.com) :
 
 | Outil (nom côté Hermes) | Rôle |
 |---|---|
 | `mcp__flowise__flowise_list_flows` | liste les flows que l'agent a le droit d'exécuter, avec pour chacun l'entrée attendue, sa documentation et son nombre de nœuds |
 | `mcp__flowise__flowise_run_flow` | exécute un flow (`flow` = nom ou id, `question` = entrée, `session_id`, `verbose`) et renvoie sa réponse ; en cas d'échec, **nomme le nœud fautif** |
+| `mcp__flowise__flowise_doctor` | état de santé, **en lecture seule** (aucun flow exécuté) : Flowise joignable, flows sains, et surtout les jobs Hermes **en pause, en erreur ou en retard** |
 
 C'est un **serveur MCP** (stdio) en un seul fichier Python, **sans dépendance** : `server.py`. L'installeur `install.py` le déclare dans
 la configuration de Hermes (`mcp_servers:` de `config.yaml`, documenté dans la [référence MCP de Hermes](https://hermes-agent.nousresearch.com/docs/reference/mcp-config-reference)).
@@ -56,6 +57,7 @@ L'installeur est idempotent, sauvegarde `config.yaml` (`config.yaml.bak-flowise-
 | `FLOWISE_MCP_ALLOW_SCHEDULE=1` | autorise aussi les flows contenant un nœud **Hermes Schedule** (qui peut créer, suspendre ou supprimer des jobs) ; refusés par défaut |
 | `FLOWISE_MCP_TIMEOUT` | délai d'un flow en secondes (défaut 300) |
 | `FLOWISE_MCP_MAX_CONCURRENT` | appels de flows simultanés (défaut 2) |
+| `FLOWISE_MCP_DOCTOR_IGNORE` | noms de jobs Hermes que le diagnostic ne doit pas signaler (séparés par des virgules) |
 
 **Boucle possible :** un flow qui contient un nœud *Hermes Task* rappelle Hermes. `flowise_list_flows` le signale
 (« appelle Hermes : ne pas le rappeler depuis ce flow ») ; ne donnez pas à un tel flow le droit de rappeler cet outil.
@@ -81,7 +83,7 @@ critère ou du JSON. `flowise_list_flows` décrit maintenant chaque flow à part
 
 Quand un nœud échoue, la réponse de `/api/v1/prediction` **ne dit pas lequel** : Flowise renvoie un HTTP 500 avec
 un message brut (`Cannot read properties of undefined (reading 'trim')`). Le serveur relit donc la dernière
-exécution enregistrée par Flowise (`GET /api/v1/executions?chatflowId=…`) et complète l'erreur :
+exécution enregistrée par Flowise et complète l'erreur :
 
 ```
 Erreur : Flowise a répondu HTTP 500. {"message":"Error: predictionsServices.buildChatflow - Error: NodeVM Execution Error: Error: BOOM-TEST"}
@@ -92,6 +94,10 @@ Dernier nœud réussi : startAgentflow_0
 L'erreur d'origine est toujours conservée en tête ; le diagnostic vient en complément. Si l'API des exécutions
 n'est pas disponible (version ancienne de Flowise, droits, panne) ou si la trace est illisible, le message
 d'origine est renvoyé inchangé — jamais d'échec à cause du diagnostic.
+
+> **Piège de l'API** : le filtre d'exécutions est `?agentflowId=<id>`. Le paramètre `chatflowId` est **ignoré** par
+> certaines versions — la requête renvoie alors les exécutions de *tous* les flows, et l'échec d'un autre flow est
+> attribué au vôtre. Le serveur refiltre donc systématiquement sur `agentflowId` côté client.
 
 Sur une exécution **réussie**, `verbose=true` ajoute la trace complète, utile pour comprendre un résultat inattendu :
 
@@ -105,6 +111,63 @@ Trace des nœuds :
   - hermesTaskAgentflow_0 (5. Verdict Hermes) : FINISHED
   - directReplyAgentflow_1 (7b. Silence (NO_ALERT)) : FINISHED
 ```
+
+## Détecter les pannes silencieuses
+
+Un flow qui casse se voit : l'appel renvoie une erreur. Mais **un job qui ne tourne pas ne produit aucun
+message**, donc rien ne se voit. C'est la panne la plus coûteuse : l'alerte que vous croyez avoir n'existe plus.
+Le diagnostic couvre exactement ce cas, et il n'exécute **rien** (aucun token dépensé, aucun message envoyé).
+
+Il vérifie :
+
+1. **Flowise** répond et la clé est valide.
+2. Chaque flow exposé est **structurellement sain** — les règles correspondent à des pannes réelles :
+   identifiant laissé en objet (cause du `HTTP 500` « reading 'trim' »), identifiant « Hermes API » non
+   sélectionné, URL vide, fonction JavaScript vide, tâche Hermes vide, absence de nœud *Start* ou de nœud de réponse.
+3. La **dernière exécution** de chaque flow n'est pas en erreur (et si elle l'est, le nœud fautif est nommé).
+4. Chaque **job Hermes** est actif, sans échec consécutif, et à l'heure : un job en pause, en erreur ou en retard
+   est signalé. Un job à intervalle court tolère moins de retard qu'un job quotidien.
+
+### En ligne de commande
+
+```bash
+FLOWISE_URL=http://localhost:3000 FLOWISE_API_KEY=... python3 ~/.hermes/tools/flowise-mcp/server.py --doctor
+```
+
+**La sortie est vide quand tout va bien** : c'est la convention watchdog, qui en fait un script de surveillance
+utilisable tel quel par une tâche planifiée (sortie vide = aucun message envoyé). En cas de problème :
+
+```
+Diagnostic flowise-mcp 0.3.0 — 3 problème(s) :
+ÉCHEC     job « Veille crypto » : 2 échec(s) consécutif(s) — Script exited with code 1 — timeout Flowise
+ATTENTION flow « mcp-actu-ia » : dernière exécution en erreur il y a 2 j — nœud « Verdict Hermes » : … hors délai
+ATTENTION job « ACTUS » : en pause depuis 2026-10-26T21:22:33 — aucune alerte ne partira
+```
+
+`--doctor --all` décrit aussi ce qui va bien (dernières exécutions, nombre de jobs vérifiés).
+
+### Depuis l'agent
+
+L'outil `flowise_doctor` expose le même diagnostic (`all=true` pour le détail), ce qui permet de demander
+simplement « est-ce que tout va bien ? » sans passer par le terminal.
+
+### Une fois par semaine, automatiquement
+
+Déposez ce script dans `$HERMES_HOME/scripts/` (il n'a que trois lignes) puis créez la tâche :
+
+```python
+# $HERMES_HOME/scripts/flowise_doctor.py
+import os, subprocess, sys
+home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+sys.exit(subprocess.call([sys.executable, os.path.join(home, "tools", "flowise-mcp", "server.py"), "--doctor"]))
+```
+
+```bash
+hermes cron create "every monday 8am" "" --no-agent --script flowise_doctor.py --deliver telegram --name "Diagnostic Flowise"
+```
+
+Un job en pause de longue date finira par être signalé à chaque passage : ajoutez son nom à
+`FLOWISE_MCP_DOCTOR_IGNORE` si la pause est volontaire.
 
 ## Vérification et dépannage
 
@@ -120,16 +183,19 @@ FLOWISE_URL=http://localhost:3000 FLOWISE_API_KEY=... python3 ~/.hermes/tools/fl
 | Outils absents après l'installation | `/reload-mcp` ou redémarrage de la passerelle ; vérifier `mcp_servers.flowise` dans `config.yaml` |
 | Un flow lent | ajuster `FLOWISE_MCP_TIMEOUT` et `timeout:` du serveur (secondes) |
 | L'erreur ne nomme pas le nœud | aucune exécution exploitable côté Flowise : lancer le flow une fois depuis son interface, puis réessayer |
+| Une alerte n'arrive plus | lancer `--doctor` : job en pause, en erreur ou en retard, ou flow cassé |
+| Le diagnostic ne lit pas les jobs | `HERMES_HOME` doit pointer sur le dossier de données de Hermes (celui qui contient `cron/jobs.json`) |
 
 Désinstaller : `python3 install.py --uninstall` (retire l'entrée de `config.yaml` et `tools/flowise-mcp/`, conserve la clé de `.env`).
 
 ## Développement
 
 ```bash
-python3 -I -m unittest discover -s tests     # 43 tests : protocole stdio, outils, filtre, diagnostic, installeur
+python3 -I -m unittest discover -s tests     # 71 tests : protocole stdio, outils, filtre, diagnostic, dépannage, installeur
 ```
 Le serveur parle JSON-RPC 2.0 (un message par ligne) et accepte les versions de protocole MCP 2025-06-18, 2025-03-26 et 2024-11-05. Les tests
-lancent `server.py` comme le fait Hermes (processus + stdio) contre un faux Flowise HTTP.
+lancent `server.py` comme le fait Hermes (processus + stdio) contre un faux Flowise HTTP, et couvrent les cas d'échec sans réseau
+(exécution illisible, job en retard, identifiant mal formé).
 
 ## Licence
 
