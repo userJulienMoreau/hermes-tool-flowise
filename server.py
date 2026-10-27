@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Serveur MCP (stdio) : donne à l'agent Hermes l'accès aux flows Flowise.
 
-Deux outils :
+Trois outils :
   flowise_list_flows()                      liste les flows autorisés (entrée attendue, documentation, nœuds)
   flowise_run_flow(flow, question[, session_id[, verbose]])   exécute un flow et renvoie sa réponse
+  flowise_doctor([all])                     état de santé, en lecture seule (aucun flow exécuté)
 
 En cas d'échec, la réponse de Flowise ne dit pas quel nœud a lâché : le serveur relit donc la dernière
 exécution enregistrée (GET /api/v1/executions?chatflowId=…) pour nommer le nœud fautif et son erreur.
@@ -18,9 +19,13 @@ Configuration (variables d'environnement) :
   FLOWISE_MCP_ALLOW_SCHEDULE=1   autorise aussi les flows contenant un nœud « Hermes Schedule » (gestion de jobs)
   FLOWISE_MCP_TIMEOUT   délai d'un appel de flow en secondes (défaut 300)
   FLOWISE_MCP_MAX_CONCURRENT   appels de flows simultanés (défaut 2)
+  FLOWISE_MCP_DOCTOR_IGNORE    noms de jobs Hermes à ne pas signaler par le diagnostic (séparés par des virgules)
 
 Convention de documentation : la première ligne non vide de la première note autocollante (Sticky Note) du flow
 devient sa description dans flowise_list_flows. Rien à configurer : une note en tête de flow suffit.
+
+Ligne de commande : `--selftest` (vérifie la configuration) et `--doctor [--all]` (état de santé ; sortie vide
+quand tout va bien, ce qui en fait un script de surveillance utilisable tel quel par une tâche planifiée).
 """
 
 import datetime
@@ -34,13 +39,15 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 HERMES_NODES = ("hermesTaskAgentflow",)
 SCHEDULE_NODES = ("hermesScheduleAgentflow",)
 NOTE_NODES = ("stickyNoteAgentflow",)
 INPUT_LABELS = {"chatInput": "texte libre", "formInput": "formulaire", "webhookTrigger": "webhook", "scheduleInput": "planifié"}
 MAX_DETAIL = 400
+DOCTOR_GRACE_S = 3 * 3600  # retard toléré avant de signaler un job (le planificateur a son propre rattrapage)
+EXECUTION_PAGE = 200  # taille de page demandée à l'API des exécutions (les plus récentes d'abord)
 
 
 class ToolError(Exception):
@@ -50,6 +57,7 @@ class ToolError(Exception):
 def load_config(env=None):
     env = os.environ if env is None else env
     allow = [p.strip() for p in (env.get("FLOWISE_MCP_ALLOW") or "mcp-*").split(",") if p.strip()]
+    ignore = [p.strip() for p in (env.get("FLOWISE_MCP_DOCTOR_IGNORE") or "").split(",") if p.strip()]
     return {
         "url": (env.get("FLOWISE_URL") or "http://localhost:3000").rstrip("/"),
         "key": env.get("FLOWISE_API_KEY") or "",
@@ -57,6 +65,7 @@ def load_config(env=None):
         "allow_schedule": (env.get("FLOWISE_MCP_ALLOW_SCHEDULE") or "") in ("1", "true", "yes"),
         "timeout": float(env.get("FLOWISE_MCP_TIMEOUT") or 300),
         "max_concurrent": int(env.get("FLOWISE_MCP_MAX_CONCURRENT") or 2),
+        "ignore_jobs": ignore,
     }
 
 
@@ -81,6 +90,36 @@ def http_json(method, url, key, body=None, timeout=30):
         raise ToolError(f"Flowise n'a pas répondu en {int(timeout)} s.")
     except ValueError:
         raise ToolError("Réponse de Flowise non JSON.")
+
+
+def parse_date(value):
+    """Date ISO (Flowise ou Hermes) -> horodatage epoch, ou None si illisible.
+
+    Les deux sources datent en UTC, avec un suffixe « Z » ou un décalage explicite.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def human_delta(seconds):
+    """Durée lisible : « 42 s », « 12 min », « 3 h 05 », « 4 j »."""
+    seconds = max(0, int(seconds))
+    if seconds < 90:
+        return f"{seconds} s"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes} min"
+    heures = minutes // 60
+    if heures < 48:
+        return f"{heures} h" + (f" {minutes % 60:02d}" if minutes % 60 else "")
+    return f"{heures // 24} j"
 
 
 def flow_nodes(flow):
@@ -138,11 +177,16 @@ def describe(flow, cfg):
             "steps": sum(1 for n in nodes if n.get("data", {}).get("name") not in NOTE_NODES)}
 
 
-def all_flows(cfg):
+def raw_flows(cfg):
+    """Flows tels que Flowise les renvoie (flowData inclus, contrairement à all_flows)."""
     flows = http_json("GET", f"{cfg['url']}/api/v1/chatflows", cfg["key"])
     if not isinstance(flows, list):
         raise ToolError("Réponse inattendue de Flowise (liste de flows attendue).")
-    return [describe(f, cfg) for f in flows]
+    return flows
+
+
+def all_flows(cfg):
+    return [describe(f, cfg) for f in raw_flows(cfg)]
 
 
 def tool_list_flows(args, cfg):
@@ -174,25 +218,21 @@ def last_execution(cfg, flow_id, since=None):
     Renvoie None si l'API des exécutions est indisponible (version ancienne, droits, panne) — ne lève jamais.
     """
     try:
-        records = http_json("GET", f"{cfg['url']}/api/v1/executions?chatflowId={flow_id}", cfg["key"], timeout=30)
+        records = http_json("GET", f"{cfg['url']}/api/v1/executions?agentflowId={flow_id}&limit={EXECUTION_PAGE}", cfg["key"], timeout=30)
     except ToolError:
         return None
     data = records.get("data") if isinstance(records, dict) else records
-    if not isinstance(data, list) or not data:
+    if not isinstance(data, list):
         return None
-
-    def stamp(record):
-        try:
-            # Flowise date ses exécutions en UTC (« 2026-10-26T22:05:11.000Z ») ; on compare à un
-            # horodatage epoch, donc il faut marquer le fuseau, sinon le décalage local fausse le filtre.
-            parsed = datetime.datetime.strptime(record["createdDate"], "%Y-%m-%dT%H:%M:%S.%fZ")
-            return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
-        except (KeyError, TypeError, ValueError):
-            return 0.0
-
-    ordered = sorted(data, key=stamp, reverse=True)
+    # Le filtre serveur est « agentflowId » (« chatflowId » est ignoré par certaines versions), et on
+    # refiltre quand même ici : sans ça, l'échec d'un AUTRE flow serait attribué à celui-ci.
+    data = [r for r in data if r.get("agentflowId") in (None, flow_id)]
+    if not data:
+        return None
+    ordered = sorted(data, key=lambda r: parse_date(r.get("createdDate")) or 0.0, reverse=True)
     if since:
-        recent = [r for r in ordered if stamp(r) >= since - 15]  # écarte l'exécution d'un appel concurrent
+        # Écarte l'exécution d'un appel concurrent : on ne garde que ce qui est postérieur au lancement.
+        recent = [r for r in ordered if (parse_date(r.get("createdDate")) or 0.0) >= since - 15]
         if recent:
             return recent[0]
     return ordered[0]
@@ -281,6 +321,148 @@ def tool_run_flow(args, cfg):
     return result
 
 
+def preflight(nodes):
+    """Contrôles structurels : ce qui casse un flow sans prévenir. Aucun flow n'est exécuté.
+
+    Chaque règle correspond à une panne réellement rencontrée (identifiant laissé en objet -> HTTP 500
+    « reading 'trim' », URL vide, fonction vide) ou à un flow qui ne peut rien renvoyer d'exploitable.
+    """
+    problemes = []
+    noms = [n.get("data", {}).get("name") for n in nodes]
+    if "startAgentflow" not in noms:
+        problemes.append("aucun nœud Start")
+    if not any(n.get("data", {}).get("name") == "directReplyAgentflow" or n.get("data", {}).get("hideOutput") for n in nodes):
+        problemes.append("aucun nœud de réponse (Direct Reply) : le flow ne renverra rien d'exploitable")
+    for n in nodes:
+        data = n.get("data", {})
+        label = data.get("label") or data.get("id") or data.get("name")
+        inputs = data.get("inputs") or {}
+        if isinstance(data.get("credential"), dict):
+            problemes.append(f"nœud « {label} » : identifiant mal formé (objet au lieu de l'id) — le flow échouera à l'exécution")
+        elif data.get("credential") == "" and data.get("name") in HERMES_NODES + SCHEDULE_NODES:
+            problemes.append(f"nœud « {label} » : aucun identifiant « Hermes API » sélectionné")
+        if data.get("name") == "httpAgentflow" and not str(inputs.get("url") or "").strip():
+            problemes.append(f"nœud « {label} » : URL vide")
+        if data.get("name") == "customFunctionAgentflow" and not str(inputs.get("customFunctionJavascriptFunction") or "").strip():
+            problemes.append(f"nœud « {label} » : fonction JavaScript vide")
+        if data.get("name") == "hermesTaskAgentflow" and not str(inputs.get("hermesPrompt") or "").strip():
+            problemes.append(f"nœud « {label} » : tâche vide")
+    return problemes
+
+
+def hermes_home():
+    return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
+def hermes_jobs():
+    """Jobs du planificateur Hermes (lecture seule). Liste vide si le fichier est absent ou illisible."""
+    try:
+        with open(os.path.join(hermes_home(), "cron", "jobs.json"), encoding="utf-8") as handle:
+            jobs = json.load(handle).get("jobs", [])
+    except (OSError, ValueError):
+        return []
+    return jobs if isinstance(jobs, list) else []
+
+
+def job_interval_seconds(job):
+    """Période d'un job à intervalle, en secondes, ou None si la cadence n'est pas un intervalle simple."""
+    schedule = job.get("schedule") or {}
+    if schedule.get("kind") == "interval" and schedule.get("minutes"):
+        try:
+            return float(schedule["minutes"]) * 60
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def job_issues(jobs, now=None, ignore=()):
+    """Pannes silencieuses du planificateur : job en pause, en erreur, ou en retard.
+
+    C'est le cœur du diagnostic : un job qui ne tourne pas ne produit aucun message, donc rien ne se voit.
+    Un job en pause est signalé volontairement — oublier de reprendre un job, c'est perdre son alerte.
+    """
+    now = time.time() if now is None else now
+    ignores = {n.strip().lower() for n in ignore if n.strip()}
+    issues = []
+    for job in jobs:
+        nom = job.get("name") or job.get("id")
+        if (nom or "").lower() in ignores:
+            continue
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            issues.append(("ATTENTION", f"job « {nom} » : en pause depuis {job.get('paused_at') or 'date inconnue'} — aucune alerte ne partira"))
+            continue
+        if job.get("failure_streak"):
+            issues.append(("ÉCHEC", f"job « {nom} » : {job['failure_streak']} échec(s) consécutif(s) — {str(job.get('last_error') or '')[:200]}"))
+        elif job.get("last_status") not in (None, "ok"):
+            issues.append(("ÉCHEC", f"job « {nom} » : dernier statut « {job['last_status']} » — {str(job.get('last_error') or '')[:200]}"))
+        prevu = parse_date(job.get("next_run_at"))
+        if prevu:
+            periode = job_interval_seconds(job)
+            tolerance = max(DOCTOR_GRACE_S, 3 * periode) if periode else DOCTOR_GRACE_S
+            if now - prevu > tolerance:
+                issues.append(("ÉCHEC", f"job « {nom} » : en retard de {human_delta(now - prevu)} (passage prévu le {job.get('next_run_at')})"))
+    return issues
+
+
+def format_problems(problems):
+    """Échecs d'abord, puis les avertissements."""
+    rang = {"ÉCHEC": 0, "ATTENTION": 1}
+    return "\n".join(f"{sev:9s} {msg}" for sev, msg in sorted(problems, key=lambda p: rang.get(p[0], 2)))
+
+
+def doctor_report(cfg, show_all=False):
+    """État de santé en LECTURE SEULE : rien n'est exécuté, rien n'est modifié.
+
+    Renvoie (problèmes, détails) : les problèmes sont des couples (sévérité, message), les détails
+    décrivent les éléments sains (affichés seulement avec show_all).
+    """
+    problemes, details, now = [], [], time.time()
+    try:
+        flows = raw_flows(cfg)
+    except ToolError as e:
+        return [("ÉCHEC", f"Flowise : {e}")], []
+
+    exposes = []
+    for flow in flows:
+        if not describe(flow, cfg)["allowed"]:
+            continue
+        exposes.append(flow)
+        for pb in preflight(flow_nodes(flow)):
+            problemes.append(("ATTENTION", f"flow « {flow['name']} » : {pb}"))
+        record = last_execution(cfg, flow["id"])
+        if record is None:
+            details.append(f"  flow « {flow['name']} » : aucune exécution enregistrée")
+            continue
+        etat = record.get("state")
+        quand = human_delta(now - (parse_date(record.get("createdDate")) or now))
+        if etat == "ERROR":
+            trace = execution_trace(record) or []
+            detail = " ; ".join(
+                f"nœud « {t.get('nodeLabel') or t.get('nodeId')} » : {str((t.get('data') or {}).get('error') or 'sans détail')[:200]}"
+                for t in trace if t.get("status") == "ERROR")
+            problemes.append(("ATTENTION", f"flow « {flow['name']} » : dernière exécution en erreur il y a {quand}" + (f" — {detail}" if detail else "")))
+        else:
+            details.append(f"  flow « {flow['name']} » : dernière exécution {etat} il y a {quand}")
+
+    jobs = hermes_jobs()
+    if jobs:
+        problemes.extend(job_issues(jobs, now, cfg.get("ignore_jobs") or ()))
+        details.append(f"  {len(jobs)} job(s) Hermes et {len(exposes)} flow(s) exposé(s) vérifiés")
+    else:
+        details.append("  jobs Hermes illisibles (cron/jobs.json absent ?)")
+    return problemes, details
+
+
+def tool_doctor(args, cfg):
+    problemes, details = doctor_report(cfg, show_all=bool(args.get("all")))
+    if problemes:
+        return "Problèmes détectés :\n" + format_problems(problemes)
+    texte = "Aucun problème détecté : Flowise répond, les flows exposés sont sains, les jobs Hermes sont à jour."
+    if args.get("all") and details:
+        texte += "\n" + "\n".join(details)
+    return texte
+
+
 TOOLS = {
     "flowise_list_flows": {
         "description": "Liste les flows Flowise que tu peux exécuter (nom, id, type, entrée attendue, documentation, nombre de nœuds).",
@@ -303,6 +485,17 @@ TOOLS = {
         },
         "handler": tool_run_flow,
     },
+    "flowise_doctor": {
+        "description": "Diagnostique l'ensemble, en lecture seule (aucun flow n'est exécuté) : Flowise joignable, flows exposés "
+                       "structurellement sains, et jobs Hermes en pause, en erreur ou en retard. À utiliser quand on demande si tout "
+                       "va bien, ou pour comprendre pourquoi une alerte attendue n'est pas arrivée.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"all": {"type": "boolean", "description": "Optionnel : décrit aussi les éléments sains"}},
+            "additionalProperties": False,
+        },
+        "handler": tool_doctor,
+    },
 }
 
 
@@ -321,7 +514,7 @@ def handle(message, cfg):
             "protocolVersion": asked if asked in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "flowise", "version": VERSION},
-            "instructions": "Exécute des flows Flowise : flowise_list_flows puis flowise_run_flow.",
+            "instructions": "Exécute des flows Flowise : flowise_list_flows puis flowise_run_flow. flowise_doctor pour l'état de santé.",
         })
     if method == "ping":
         return ok({})
@@ -383,7 +576,34 @@ def selftest(cfg):
     return 0
 
 
+def doctor_cli(cfg, show_all=False):
+    """État de santé en ligne de commande.
+
+    Sortie VIDE quand tout va bien : c'est ce qui en fait un script de surveillance utilisable tel quel
+    par une tâche planifiée Hermes (sortie vide = aucun message envoyé).
+    """
+    problemes, details = doctor_report(cfg, show_all=show_all)
+    if problemes:
+        print(f"Diagnostic flowise-mcp {VERSION} — {len(problemes)} problème(s) :")
+        print(format_problems(problemes))
+    elif show_all:
+        print(f"Diagnostic flowise-mcp {VERSION} — aucun problème.")
+        if details:
+            print("\n".join(details))
+    return 0
+
+
 if __name__ == "__main__":
-    if "--selftest" in sys.argv:
-        sys.exit(selftest(load_config()))
+    config = load_config()
+    options = sys.argv[1:]
+    if "--selftest" in options:
+        sys.exit(selftest(config))
+    if "--doctor" in options:
+        sys.exit(doctor_cli(config, show_all="--all" in options))
+    inconnues = [o for o in options if o != "--all"]
+    if inconnues:
+        # Sans ce garde-fou, une faute de frappe ferait démarrer le serveur stdio, qui lirait une entrée
+        # vide et sortirait en 0 : un script de surveillance se tairait au lieu de signaler l'erreur.
+        print(f"Option inconnue : {' '.join(inconnues)}. Options acceptées : --selftest, --doctor [--all].", file=sys.stderr)
+        sys.exit(2)
     serve()

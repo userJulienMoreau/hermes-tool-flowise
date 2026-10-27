@@ -281,9 +281,10 @@ class ProtocolTest(unittest.TestCase):
         init2 = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "9999-01-01"}}, cfg)["result"]
         self.assertEqual(init2["protocolVersion"], server.SUPPORTED_PROTOCOLS[0])
         tools = server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, cfg)["result"]["tools"]
-        self.assertEqual([t["name"] for t in tools], ["flowise_list_flows", "flowise_run_flow"])
+        self.assertEqual([t["name"] for t in tools], ["flowise_list_flows", "flowise_run_flow", "flowise_doctor"])
         self.assertEqual(tools[1]["inputSchema"]["required"], ["flow", "question"])
         self.assertIn("verbose", tools[1]["inputSchema"]["properties"])
+        self.assertIn("all", tools[2]["inputSchema"]["properties"])
 
     def test_notification_sans_reponse_methode_et_outil_inconnus(self):
         cfg = server.load_config({})
